@@ -371,7 +371,7 @@ function FeatureCard({
 }) {
   return (
     <div
-      className={`rounded-2xl border border-zinc-200 bg-zinc-50 p-10 transition duration-200 hover:-translate-y-1 hover:shadow-xl hover:shadow-zinc-300/60 ${
+      className={`rounded-2xl border border-zinc-200 bg-zinc-50 p-10 transition duration-200 hover:border-zinc-300 hover:shadow-xl hover:shadow-zinc-300/60 ${
         tall ? "min-h-[320px] min-w-[230px] sm:min-w-[250px] lg:min-w-0 lg:flex-1" : ""
       }`}
     >

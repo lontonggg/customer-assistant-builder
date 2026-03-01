@@ -151,6 +151,38 @@ class DatabaseIngestor:
         text = str(value).strip()
         return [text] if text else []
 
+    def _to_numeric_or_none(self, value: Any) -> Optional[float]:
+        """Convert input to float for NUMERIC columns; return None for empty/invalid values."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        if text == "":
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    def _to_int_or_none(self, value: Any) -> Optional[int]:
+        """Convert input to int for INT columns; return None for empty/invalid values."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        text = str(value).strip()
+        if text == "":
+            return None
+        try:
+            return int(float(text))
+        except ValueError:
+            return None
+
     def _insert_business(self, business_data: Dict[str, Any]) -> str:
         """Insert or update business data and return business UUID"""
         vertical_id = self._get_or_create_business_vertical_id(business_data.get('vertical', 'fashion'))
@@ -243,6 +275,10 @@ class DatabaseIngestor:
             for i, item in enumerate(valid_items):
                 if item_type == "catalog":
                     tags = self._ensure_text_array(item.get('tags'))
+                    price = self._to_numeric_or_none(item.get('price'))
+                    price_min = self._to_numeric_or_none(item.get('price_min'))
+                    price_max = self._to_numeric_or_none(item.get('price_max'))
+                    duration_mins = self._to_int_or_none(item.get('duration_mins'))
                     cursor.execute("""
                         INSERT INTO catalog_item (business_id, name, short_desc, long_desc, price,
                                                 price_min, price_max, currency_code, duration_mins,
@@ -250,9 +286,9 @@ class DatabaseIngestor:
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, NOW(), NOW())
                         RETURNING id
                     """, (business_id, item.get('name'), item.get('short_desc'),
-                          item.get('long_desc'), item.get('price'), item.get('price_min'),
-                          item.get('price_max'), item.get('currency_code', 'SGD'),
-                          item.get('duration_mins'), tags,
+                          item.get('long_desc'), price, price_min,
+                          price_max, item.get('currency_code', 'SGD'),
+                          duration_mins, tags,
                           json.dumps(item.get('metadata', {}))))
 
                 elif item_type == "faq":
