@@ -1,0 +1,178 @@
+@import "tailwindcss";
+
+:root {
+  --color-primary: #111827;
+  --color-surface: #f8fafc;
+  --color-ink: #111827;
+  color: var(--color-ink);
+  background-color: var(--color-surface);
+  font-family: "Space Grotesk", system-ui, -apple-system, sans-serif;
+}
+
+@layer base {
+  * {
+    @apply border-transparent;
+  }
+
+  body {
+    @apply min-h-screen bg-[var(--color-surface)] text-[var(--color-ink)] antialiased;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, #9ca3af 30%, transparent);
+    color: #111315;
+  }
+}
+
+@layer components {
+  .glass {
+    @apply bg-white border border-zinc-200 shadow-xl;
+  }
+
+  .card-grid {
+    @apply grid gap-6 lg:grid-cols-[1.8fr_1fr];
+  }
+
+  .animate-fade-up {
+    animation: fade-up 0.7s ease forwards;
+  }
+
+  .animate-float {
+    animation: float 8s ease-in-out infinite;
+  }
+
+  .animate-soft {
+    animation: soft-pulse 3s ease-in-out infinite;
+  }
+
+  .animate-drift {
+    animation: drift 14s ease-in-out infinite;
+  }
+
+  .animate-marquee {
+    animation: marquee 24s linear infinite;
+  }
+
+  .animate-pop {
+    animation: pop-in 0.8s ease both;
+  }
+
+  .animate-shimmer {
+    background-size: 200% 100%;
+    animation: shimmer 3s linear infinite;
+  }
+
+  .markdown-message p {
+    margin: 0.25rem 0;
+    white-space: pre-wrap;
+  }
+
+  .markdown-message ul,
+  .markdown-message ol {
+    margin: 0.25rem 0 0.25rem 1rem;
+  }
+
+  .markdown-message li {
+    margin: 0.15rem 0;
+  }
+
+  .markdown-message h1,
+  .markdown-message h2,
+  .markdown-message h3 {
+    margin: 0.35rem 0;
+    font-weight: 600;
+  }
+
+  .markdown-message code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    background: rgba(0, 0, 0, 0.06);
+    border-radius: 0.25rem;
+    padding: 0.05rem 0.25rem;
+  }
+
+  .markdown-message pre {
+    overflow: auto;
+    margin: 0.35rem 0;
+    padding: 0.5rem;
+    border-radius: 0.5rem;
+    background: rgba(0, 0, 0, 0.06);
+  }
+
+  .markdown-message a {
+    text-decoration: underline;
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes float {
+  0% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
+  100% {
+    transform: translateY(0px);
+  }
+}
+
+@keyframes soft-pulse {
+  0%,
+  100% {
+    opacity: 0.8;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes drift {
+  0% {
+    transform: translate3d(0, 0, 0) rotate(0deg);
+  }
+  50% {
+    transform: translate3d(12px, -10px, 0) rotate(1deg);
+  }
+  100% {
+    transform: translate3d(0, 0, 0) rotate(0deg);
+  }
+}
+
+@keyframes marquee {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+@keyframes pop-in {
+  0% {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: 200% 50%;
+  }
+}

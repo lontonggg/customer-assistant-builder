@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-dotenv
+litellm
+python-multipart
+pypdf
+httpx
