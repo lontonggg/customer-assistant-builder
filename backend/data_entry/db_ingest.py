@@ -1,422 +1,290 @@
 """
-Database ingestion module for inserting extracted JSON data into PostgreSQL with embeddings
+Knowledge ingestion module — stores extracted data in SQLite + ChromaDB with Vertex AI embeddings.
 """
 import json
 import os
-import psycopg2
+import sqlite3
 import uuid
-import re
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, List, Optional
+
+import chromadb
+import vertexai
+from vertexai.language_models import TextEmbeddingModel
 from dotenv import load_dotenv
-from mistralai import Mistral
 
 load_dotenv(dotenv_path="../.env")
 
-class DatabaseIngestor:
-    def __init__(self, db_connection_string: Optional[str] = None):
-        """Initialize database connection and Mistral client"""
-        if db_connection_string:
-            self.connection_string = db_connection_string
-        else:
-            self.connection_string = (
-                f"postgresql://{os.getenv('DB_USER', 'postgres')}"
-                f":{os.getenv('DB_PASSWORD', 'postgres')}"
-                f"@{os.getenv('DB_HOST', 'localhost')}"
-                f":{os.getenv('DB_PORT', '5432')}"
-                f"/{os.getenv('DB_NAME', 'chayono')}"
-            )
+EMBED_MODEL = "text-embedding-004"
 
-        self.conn = None
 
-        # Initialize Mistral client for embeddings
-        api_key = os.getenv("MISTRAL_API_KEY")
-        self.mistral_client = Mistral(api_key=api_key) if api_key else None
+def _init_vertexai():
+    project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+    vertexai.init(project=project, location=location)
 
-    def connect(self):
-        """Establish database connection"""
+
+def _generate_embeddings(texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+    model = TextEmbeddingModel.from_pretrained(EMBED_MODEL)
+    all_embeddings: List[List[float]] = []
+    for i in range(0, len(texts), 50):
+        batch = texts[i:i + 50]
+        results = model.get_embeddings(batch)
+        all_embeddings.extend([r.values for r in results])
+    return all_embeddings
+
+
+class KnowledgeIngestor:
+    def __init__(self, sqlite_db_path: str, chroma_db_path: str):
+        _init_vertexai()
+        self.sqlite_db_path = sqlite_db_path
+        self.chroma_client = chromadb.PersistentClient(path=chroma_db_path)
+        self.catalog_col = self.chroma_client.get_or_create_collection("catalog_items")
+        self.faq_col = self.chroma_client.get_or_create_collection("faqs")
+        self.others_col = self.chroma_client.get_or_create_collection("others")
+
+    def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.sqlite_db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _clear_agent_knowledge(self, agent_id: str):
+        conn = self._get_conn()
+        for table in ("business_info", "catalog_items", "faqs", "knowledge_others"):
+            conn.execute(f"DELETE FROM {table} WHERE agent_id = ?", (agent_id,))
+        conn.commit()
+        conn.close()
+
+        for col in (self.catalog_col, self.faq_col, self.others_col):
+            try:
+                existing = col.get(where={"agent_id": agent_id})
+                if existing["ids"]:
+                    col.delete(ids=existing["ids"])
+            except Exception:
+                pass
+
+    def _chroma_add(self, collection, ids, texts, embeddings, agent_id: str):
+        if not ids or not embeddings:
+            return
+        collection.add(
+            ids=ids,
+            embeddings=embeddings,
+            documents=texts,
+            metadatas=[{"agent_id": agent_id} for _ in ids],
+        )
+
+    def ingest(self, agent_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        self._clear_agent_knowledge(agent_id)
+
+        conn = self._get_conn()
+        catalog_ids, catalog_texts = [], []
+        faq_ids, faq_texts = [], []
+        others_ids, others_texts = [], []
+
         try:
-            self.conn = psycopg2.connect(self.connection_string)
-            return True
-        except psycopg2.Error as e:
-            raise Exception(f"Failed to connect to database: {e}")
-
-    def disconnect(self):
-        """Close database connection"""
-        if self.conn:
-            self.conn.close()
-            self.conn = None
-
-    def _get_or_create_business_vertical_id(self, vertical: str) -> int:
-        """Get business vertical ID by code"""
-        with self.conn.cursor() as cursor:
-            cursor.execute("SELECT id FROM business_vertical WHERE code = %s", (vertical,))
-            result = cursor.fetchone()
-            if result:
-                return result[0]
-            else:
-                raise ValueError(f"Unknown business vertical: {vertical}")
-
-    def _generate_slug(self, name: str) -> str:
-        """Generate URL-safe slug from business name"""
-        slug = re.sub(r'[^\w\s-]', '', name.lower())
-        slug = re.sub(r'[-\s]+', '-', slug)
-        return slug.strip('-')
-
-    def _generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings using Mistral embed model"""
-        if not self.mistral_client or not texts:
-            return []
-
-        try:
-            batch_size = 50
-            all_embeddings = []
-
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
-                response = self.mistral_client.embeddings.create(
-                    model="mistral-embed",
-                    inputs=batch
+            # Business info
+            business = data.get("business") or {}
+            if business:
+                contact = business.get("contact_info") or {}
+                if not isinstance(contact, dict):
+                    contact = {}
+                for k in ("phone", "email", "address", "city", "country", "website"):
+                    value = (
+                        contact.get(k)
+                        or business.get(k)
+                        or business.get(f"contact_info_{k}")
+                    )
+                    if value not in (None, ""):
+                        contact[k] = value
+                conn.execute(
+                    "INSERT INTO business_info (agent_id, name, vertical, description, contact_info) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        agent_id,
+                        business.get("name"),
+                        business.get("vertical"),
+                        business.get("description") or business.get("tagline"),
+                        json.dumps(contact),
+                    ),
                 )
-                batch_embeddings = [data.embedding for data in response.data]
-                all_embeddings.extend(batch_embeddings)
+                # Also index business/contact summary into semantic search so contact queries can be answered reliably.
+                contact_parts = []
+                for key in ("phone", "email", "website", "address", "city", "country"):
+                    value = str((contact or {}).get(key) or "").strip()
+                    if value:
+                        contact_parts.append(f"{key}: {value}")
+                summary_parts = []
+                if business.get("name"):
+                    summary_parts.append(f"Business: {business.get('name')}")
+                if business.get("vertical"):
+                    summary_parts.append(f"Vertical: {business.get('vertical')}")
+                if business.get("description") or business.get("tagline"):
+                    summary_parts.append(f"Description: {business.get('description') or business.get('tagline')}")
+                if contact_parts:
+                    summary_parts.append("Contact info: " + " | ".join(contact_parts))
+                if summary_parts:
+                    item_id = str(uuid.uuid4())
+                    conn.execute(
+                        "INSERT INTO knowledge_others (id, agent_id, item_type, title, content, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            item_id,
+                            agent_id,
+                            "business_profile",
+                            str(business.get("name") or "Business Profile"),
+                            " | ".join(summary_parts),
+                            json.dumps({"source": "business_info"}),
+                        ),
+                    )
+                    others_ids.append(item_id)
+                    others_texts.append(" | ".join(summary_parts))
 
-            return all_embeddings
-        except Exception as e:
-            raise Exception(f"Failed to generate embeddings: {e}")
-
-    def _create_embedding_texts(self, items: List[Dict[str, Any]], item_type: str) -> List[str]:
-        """Create composite texts for embeddings based on item type"""
-        texts = []
-
-        for item in items:
-            if item_type == "catalog":
-                parts = []
-                if item.get('name'): parts.append(f"Name: {item['name']}")
-                if item.get('short_desc'): parts.append(f"Description: {item['short_desc']}")
-                if item.get('long_desc'): parts.append(f"Details: {item['long_desc']}")
-                if item.get('tags'): parts.append(f"Tags: {', '.join(item['tags'])}")
-
-                metadata = item.get('metadata', {})
-                if metadata:
-                    metadata_parts = [f"{k}: {', '.join(v) if isinstance(v, list) else v}"
-                                    for k, v in metadata.items() if v]
-                    if metadata_parts:
-                        parts.append(f"Attributes: {'; '.join(metadata_parts)}")
-
-                texts.append(" | ".join(parts))
-
-            elif item_type == "faq":
-                question = item.get('question', '').strip()
-                answer = item.get('answer', '').strip()
-                parts = []
-                if question: parts.append(f"Q: {question}")
-                if answer: parts.append(f"A: {answer}")
-                texts.append(" ".join(parts))
-
-            elif item_type == "doctor":
-                parts = []
-                if item.get('full_name'): parts.append(f"Dr. {item['full_name']}")
-                if item.get('title'): parts.append(f"Title: {item['title']}")
-                if item.get('specialization'): parts.append(f"Specialization: {item['specialization']}")
-                qualifications = self._ensure_text_array(item.get('qualifications'))
-                languages = self._ensure_text_array(item.get('languages'))
-                if qualifications: parts.append(f"Qualifications: {', '.join(qualifications)}")
-                if languages: parts.append(f"Languages: {', '.join(languages)}")
-                if item.get('bio'): parts.append(f"Bio: {item['bio']}")
-                texts.append(" | ".join(parts))
-
-        return texts
-
-    def _ensure_text_array(self, value: Any) -> List[str]:
-        """Normalize arbitrary input into a clean list[str] for Postgres array columns."""
-        if value is None:
-            return []
-        if isinstance(value, list):
-            out: List[str] = []
-            for item in value:
-                if item is None:
+            # Catalog items
+            catalog_items = data.get("catalog") or data.get("catalog_items") or []
+            for item in catalog_items:
+                name = str(item.get("name") or "").strip()
+                if not name:
                     continue
-                text = str(item).strip()
-                if text:
-                    out.append(text)
-            return out
-        if isinstance(value, str):
-            text = value.strip()
-            if not text:
-                return []
-            # Support comma/newline/semicolon separated strings.
-            parts = re.split(r"[,;\n]+", text)
-            return [p.strip() for p in parts if p and p.strip()]
-        # Fallback for numbers/bools/other primitives
-        text = str(value).strip()
-        return [text] if text else []
+                item_id = str(uuid.uuid4())
+                extra = {k: v for k, v in item.items()
+                         if k not in {"category", "name", "description", "short_desc", "long_desc", "price", "price_min", "tags"}}
+                conn.execute(
+                    "INSERT INTO catalog_items (id, agent_id, category, name, description, price, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        item_id, agent_id,
+                        item.get("category"),
+                        name,
+                        item.get("description") or item.get("short_desc") or item.get("long_desc"),
+                        str(item.get("price") or item.get("price_min") or ""),
+                        json.dumps(extra),
+                    ),
+                )
+                parts = [f"Name: {name}"]
+                if item.get("category"):
+                    parts.append(f"Category: {item['category']}")
+                desc = item.get("description") or item.get("short_desc") or item.get("long_desc") or ""
+                if desc:
+                    parts.append(f"Description: {desc}")
+                price = item.get("price") or item.get("price_min")
+                if price:
+                    parts.append(f"Price: {price}")
+                tags = item.get("tags")
+                if isinstance(tags, list) and tags:
+                    parts.append(f"Tags: {', '.join(str(t) for t in tags)}")
+                catalog_ids.append(item_id)
+                catalog_texts.append(" | ".join(parts))
 
-    def _to_numeric_or_none(self, value: Any) -> Optional[float]:
-        """Convert input to float for NUMERIC columns; return None for empty/invalid values."""
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            return float(value)
-        text = str(value).strip()
-        if text == "":
-            return None
-        try:
-            return float(text)
-        except ValueError:
-            return None
+            # FAQs
+            faqs = data.get("faqs") or []
+            for faq in faqs:
+                q = str(faq.get("question") or "").strip()
+                a = str(faq.get("answer") or "").strip()
+                if not (q and a):
+                    continue
+                faq_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO faqs (id, agent_id, question, answer) VALUES (?, ?, ?, ?)",
+                    (faq_id, agent_id, q, a),
+                )
+                faq_ids.append(faq_id)
+                faq_texts.append(f"Q: {q} A: {a}")
 
-    def _to_int_or_none(self, value: Any) -> Optional[int]:
-        """Convert input to int for INT columns; return None for empty/invalid values."""
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            return int(value)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            return int(value)
-        text = str(value).strip()
-        if text == "":
-            return None
-        try:
-            return int(float(text))
-        except ValueError:
-            return None
+            # Others (generic entities)
+            others = data.get("others") or []
+            # Map legacy doctors list into others
+            doctors = data.get("doctors") or []
+            if doctors and not others:
+                others = [
+                    {
+                        "item_type": "doctor",
+                        "title": d.get("full_name") or d.get("name") or "",
+                        "content": " | ".join(filter(None, [
+                            d.get("specialization"),
+                            d.get("bio"),
+                            ", ".join(d["qualifications"]) if isinstance(d.get("qualifications"), list) else d.get("qualifications"),
+                        ])),
+                        "metadata": d,
+                    }
+                    for d in doctors if d.get("full_name") or d.get("name")
+                ]
 
-    def _insert_business(self, business_data: Dict[str, Any]) -> str:
-        """Insert or update business data and return business UUID"""
-        vertical_id = self._get_or_create_business_vertical_id(business_data.get('vertical', 'fashion'))
-        slug = self._generate_slug(business_data.get('name', 'unknown'))
+            for item in others:
+                title = str(item.get("title") or "").strip()
+                content = str(item.get("content") or "").strip()
+                if not title and not content:
+                    continue
+                item_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO knowledge_others (id, agent_id, item_type, title, content, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        item_id, agent_id,
+                        item.get("item_type"),
+                        title,
+                        content,
+                        json.dumps(item.get("metadata") or {}),
+                    ),
+                )
+                parts = []
+                if item.get("item_type"):
+                    parts.append(f"Type: {item['item_type']}")
+                if title:
+                    parts.append(title)
+                if content:
+                    parts.append(content)
+                others_ids.append(item_id)
+                others_texts.append(" | ".join(parts))
 
-        with self.conn.cursor() as cursor:
-            cursor.execute("SELECT id FROM business WHERE slug = %s", (slug,))
-            result = cursor.fetchone()
-
-            if result:
-                # Update existing business
-                business_id = result[0]
-                cursor.execute("""
-                    UPDATE business SET name = %s, tagline = %s, phone = %s, email = %s,
-                           address = %s, city = %s, country = %s, updated_at = NOW()
-                    WHERE id = %s
-                """, (business_data.get('name'), business_data.get('tagline'),
-                      business_data.get('phone'), business_data.get('email'),
-                      business_data.get('address'), business_data.get('city'),
-                      business_data.get('country', 'Singapore'), business_id))
-            else:
-                # Create new business
-                business_id = str(uuid.uuid4())
-                cursor.execute("""
-                    INSERT INTO business (id, vertical_id, name, slug, tagline, phone, email,
-                                        address, city, country, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-                """, (business_id, vertical_id, business_data.get('name'), slug,
-                      business_data.get('tagline'), business_data.get('phone'),
-                      business_data.get('email'), business_data.get('address'),
-                      business_data.get('city'), business_data.get('country', 'Singapore')))
-
-        return business_id
-
-    def _insert_categories(self, business_id: str, categories: List[Dict[str, Any]]):
-        """Insert categories for the business"""
-        with self.conn.cursor() as cursor:
-            cursor.execute("DELETE FROM category WHERE business_id = %s", (business_id,))
-
-            for i, category in enumerate(categories):
-                cursor.execute("""
-                    INSERT INTO category (business_id, name, slug, display_order)
-                    VALUES (%s, %s, %s, %s)
-                """, (business_id, category.get('name'),
-                      category.get('slug', self._generate_slug(category.get('name', ''))),
-                      category.get('display_order', i + 1)))
-
-    def _insert_with_embeddings(self, business_id: str, items: List[Dict[str, Any]],
-                               item_type: str, table_name: str, embedding_table: str):
-        """Generic method to insert items with their embeddings"""
-        with self.conn.cursor() as cursor:
-            # Clear existing data
-            cursor.execute(f"DELETE FROM {table_name} WHERE business_id = %s", (business_id,))
-
-            if not items:
-                return
-
-            # Filter valid items
-            valid_items = []
-            for item in items:
-                if item_type == "catalog" and item.get('name', '').strip():
-                    valid_items.append(item)
-                elif item_type == "faq":
-                    question = item.get('question', '').strip()
-                    answer = item.get('answer', '').strip()
-
-                    if not question or not answer:
-                        # Fix malformed FAQ
-                        if question and not answer and any(word in question.lower()
-                                                         for word in ['provide', 'offer', 'guarantee', 'policy']):
-                            answer = question
-                            question = f"What is your policy regarding {item.get('intent_tags', ['services'])[0] if item.get('intent_tags') else 'this service'}?"
-                            item_copy = item.copy()
-                            item_copy['question'] = question
-                            item_copy['answer'] = answer
-                            valid_items.append(item_copy)
-                    else:
-                        valid_items.append(item)
-                elif item_type == "doctor" and item.get('full_name', '').strip():
-                    valid_items.append(item)
-
-            if not valid_items:
-                return
-
-            # Generate embeddings
-            embedding_texts = self._create_embedding_texts(valid_items, item_type)
-            embeddings = self._generate_embeddings(embedding_texts)
-
-            # Insert items and embeddings
-            for i, item in enumerate(valid_items):
-                if item_type == "catalog":
-                    tags = self._ensure_text_array(item.get('tags'))
-                    price = self._to_numeric_or_none(item.get('price'))
-                    price_min = self._to_numeric_or_none(item.get('price_min'))
-                    price_max = self._to_numeric_or_none(item.get('price_max'))
-                    duration_mins = self._to_int_or_none(item.get('duration_mins'))
-                    cursor.execute("""
-                        INSERT INTO catalog_item (business_id, name, short_desc, long_desc, price,
-                                                price_min, price_max, currency_code, duration_mins,
-                                                tags, metadata, is_available, created_at, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE, NOW(), NOW())
-                        RETURNING id
-                    """, (business_id, item.get('name'), item.get('short_desc'),
-                          item.get('long_desc'), price, price_min,
-                          price_max, item.get('currency_code', 'SGD'),
-                          duration_mins, tags,
-                          json.dumps(item.get('metadata', {}))))
-
-                elif item_type == "faq":
-                    intent_tags = self._ensure_text_array(item.get('intent_tags'))
-                    cursor.execute("""
-                        INSERT INTO faq (business_id, question, answer, intent_tags, priority,
-                                       is_active, created_at, updated_at)
-                        VALUES (%s, %s, %s, %s, %s, TRUE, NOW(), NOW())
-                        RETURNING id
-                    """, (business_id, item.get('question'), item.get('answer'),
-                          intent_tags, item.get('priority', 5)))
-
-                elif item_type == "doctor":
-                    qualifications = self._ensure_text_array(item.get('qualifications'))
-                    languages = self._ensure_text_array(item.get('languages'))
-                    cursor.execute("""
-                        INSERT INTO doctor (business_id, full_name, title, specialization,
-                                          qualifications, bio, languages, is_active)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
-                        RETURNING id
-                    """, (business_id, item.get('full_name'), item.get('title'),
-                          item.get('specialization'), qualifications,
-                          item.get('bio'), languages))
-
-                item_id = cursor.fetchone()[0]
-
-                # Insert embedding if available
-                if embeddings and i < len(embeddings):
-                    if item_type == "catalog":
-                        cursor.execute("""
-                            INSERT INTO catalog_item_embedding (item_id, embedding, source_text, embed_model, updated_at)
-                            VALUES (%s, %s, %s, %s, NOW())
-                        """, (item_id, embeddings[i], embedding_texts[i], "mistral-embed"))
-                    elif item_type == "faq":
-                        cursor.execute("""
-                            INSERT INTO faq_embedding (faq_id, embedding, source_text, embed_model, updated_at)
-                            VALUES (%s, %s, %s, %s, NOW())
-                        """, (item_id, embeddings[i], embedding_texts[i], "mistral-embed"))
-                    elif item_type == "doctor":
-                        cursor.execute("""
-                            INSERT INTO doctor_embedding (doctor_id, embedding, source_text, embed_model, updated_at)
-                            VALUES (%s, %s, %s, %s, NOW())
-                        """, (item_id, embeddings[i], embedding_texts[i], "mistral-embed"))
-
-    def ingest_json_data(self, json_file_path: str) -> Dict[str, Any]:
-        """Ingest data from extracted JSON file into database with embeddings"""
-        if not os.path.exists(json_file_path):
-            raise FileNotFoundError(f"JSON file not found: {json_file_path}")
-
-        # Load JSON data
-        with open(json_file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        # Connect to database
-        self.connect()
-
-        try:
-            # Start transaction
-            self.conn.autocommit = False
-
-            # Insert business
-            business_id = self._insert_business(data.get('business', {}))
-
-            # Insert related data with embeddings
-            categories = data.get('categories', [])
-            if categories:
-                self._insert_categories(business_id, categories)
-
-            catalog_items = data.get('catalog_items', [])
-            if catalog_items:
-                self._insert_with_embeddings(business_id, catalog_items, "catalog",
-                                            "catalog_item", "catalog_item_embedding")
-
-            faqs = data.get('faqs', [])
-            if faqs:
-                self._insert_with_embeddings(business_id, faqs, "faq",
-                                            "faq", "faq_embedding")
-
-            doctors = data.get('doctors', [])
-            if doctors:
-                self._insert_with_embeddings(business_id, doctors, "doctor",
-                                            "doctor", "doctor_embedding")
-
-            # Commit transaction
-            self.conn.commit()
-
-            return {
-                "success": True,
-                "business_id": business_id,
-                "business_name": data.get('business', {}).get('name', 'Unknown'),
-                "inserted_counts": {
-                    "categories": len(categories),
-                    "catalog_items": len(catalog_items),
-                    "faqs": len(faqs),
-                    "doctors": len(doctors)
-                }
-            }
-
-        except Exception as e:
-            self.conn.rollback()
-            raise Exception(f"Database ingestion failed: {e}")
+            conn.commit()
         finally:
-            self.disconnect()
+            conn.close()
+
+        # Generate and store embeddings in ChromaDB
+        if catalog_ids:
+            self._chroma_add(self.catalog_col, catalog_ids, catalog_texts,
+                             _generate_embeddings(catalog_texts), agent_id)
+        if faq_ids:
+            self._chroma_add(self.faq_col, faq_ids, faq_texts,
+                             _generate_embeddings(faq_texts), agent_id)
+        if others_ids:
+            self._chroma_add(self.others_col, others_ids, others_texts,
+                             _generate_embeddings(others_texts), agent_id)
+
+        return {
+            "success": True,
+            "agent_id": agent_id,
+            "inserted_counts": {
+                "catalog_items": len(catalog_ids),
+                "faqs": len(faq_ids),
+                "others": len(others_ids),
+            },
+        }
 
 
-def ingest_extracted_data(json_file_path: str, db_connection_string: Optional[str] = None) -> Dict[str, Any]:
-    """Convenience function to ingest extracted data into database"""
-    ingestor = DatabaseIngestor(db_connection_string)
-    return ingestor.ingest_json_data(json_file_path)
+def ingest_extracted_data(
+    json_file_path: str,
+    agent_id: str,
+    sqlite_db_path: str,
+    chroma_db_path: str,
+) -> Dict[str, Any]:
+    with open(json_file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    ingestor = KnowledgeIngestor(sqlite_db_path, chroma_db_path)
+    return ingestor.ingest(agent_id, data)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Ingest extracted JSON data into PostgreSQL database")
-    parser.add_argument("json_file", help="Path to extracted JSON data file")
-    parser.add_argument("--db-connection", help="Database connection string")
-
+    parser = argparse.ArgumentParser(description="Ingest extracted JSON knowledge into SQLite + ChromaDB")
+    parser.add_argument("json_file", help="Path to extracted JSON file")
+    parser.add_argument("--agent-id", required=True, help="Agent ID to associate knowledge with")
+    parser.add_argument("--sqlite-db", required=True, help="Path to SQLite database file")
+    parser.add_argument("--chroma-db", required=True, help="Path to ChromaDB directory")
     args = parser.parse_args()
 
     try:
-        result = ingest_extracted_data(args.json_file, args.db_connection)
-
-        print(f"✅ Database ingestion completed!")
-        print(f"Business: {result['business_name']} (ID: {result['business_id']})")
-        print("Inserted:")
-        for entity, count in result['inserted_counts'].items():
-            print(f"  - {entity}: {count}")
-
+        result = ingest_extracted_data(args.json_file, args.agent_id, args.sqlite_db, args.chroma_db)
+        print(f"Ingestion completed! Agent: {result['agent_id']}")
+        for entity, count in result["inserted_counts"].items():
+            print(f"  {entity}: {count}")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error: {e}")

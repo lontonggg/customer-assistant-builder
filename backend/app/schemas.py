@@ -8,15 +8,16 @@ class CreateAgentRequest(BaseModel):
     description: str
     instruction: str = "You are a helpful assistant."
     language: str = "en-US"
-    model: str = "mistral-small"
+    model: str = "gemini-2.5-flash"
     temperature: float = 0.5
-    business_type: str = "Fashion"
+    business_type: str = "General"
     use_voice_to_voice: bool = True
     voice_gender: str = "female"
     business_info: dict = {}
     catalog_items: list[dict] = []
     faqs: list[dict] = []
     doctors: list[dict] = []
+    others: list[dict] = []
 
 
 class CreateSessionRequest(BaseModel):
@@ -38,17 +39,18 @@ class UpdateAgentRequest(BaseModel):
     instruction: str
     language: str
     temperature: float
-    business_type: str = "Fashion"
+    business_type: str = "General"
     use_voice_to_voice: bool = True
     voice_gender: str = "female"
     business_info: dict = {}
     catalog_items: list[dict] = []
     faqs: list[dict] = []
     doctors: list[dict] = []
+    others: list[dict] = []
 
 
 class ProcessedKnowledgeResponse(BaseModel):
     business_info: dict
     catalog_items: list[dict]
     faqs: list[dict]
-    doctors: list[dict]
+    others: list[dict]

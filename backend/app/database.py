@@ -79,10 +79,65 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS business_info (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            name TEXT,
+            vertical TEXT,
+            description TEXT,
+            contact_info TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS catalog_items (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            category TEXT,
+            name TEXT NOT NULL,
+            description TEXT,
+            price TEXT,
+            metadata TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS faqs (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            answer TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_others (
+            id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            item_type TEXT,
+            title TEXT,
+            content TEXT,
+            metadata TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY(agent_id) REFERENCES agents(id) ON DELETE CASCADE
+        )
+        """
+    )
 
     cols = {row["name"] for row in cur.execute("PRAGMA table_info(agents)").fetchall()}
     if "business_type" not in cols:
-        cur.execute("ALTER TABLE agents ADD COLUMN business_type TEXT NOT NULL DEFAULT 'Fashion'")
+        cur.execute("ALTER TABLE agents ADD COLUMN business_type TEXT NOT NULL DEFAULT 'General'")
     if "use_voice_to_voice" not in cols:
         cur.execute("ALTER TABLE agents ADD COLUMN use_voice_to_voice INTEGER NOT NULL DEFAULT 0")
     if "voice_gender" not in cols:
@@ -95,6 +150,8 @@ def init_db() -> None:
         cur.execute("ALTER TABLE agents ADD COLUMN faqs_json TEXT NOT NULL DEFAULT '[]'")
     if "doctors_json" not in cols:
         cur.execute("ALTER TABLE agents ADD COLUMN doctors_json TEXT NOT NULL DEFAULT '[]'")
+    if "others_json" not in cols:
+        cur.execute("ALTER TABLE agents ADD COLUMN others_json TEXT NOT NULL DEFAULT '[]'")
 
     conn.commit()
     conn.close()
@@ -117,6 +174,10 @@ def row_to_agent(row: sqlite3.Row, knowledge_count: int = 0) -> dict:
         doctors = json.loads(row["doctors_json"]) if "doctors_json" in row.keys() else []
     except Exception:
         doctors = []
+    try:
+        others = json.loads(row["others_json"]) if "others_json" in row.keys() else []
+    except Exception:
+        others = []
 
     return {
         "id": row["id"],
@@ -126,7 +187,7 @@ def row_to_agent(row: sqlite3.Row, knowledge_count: int = 0) -> dict:
         "language": row["language"],
         "model": row["model"],
         "temperature": row["temperature"],
-        "business_type": row["business_type"] if "business_type" in row.keys() else "Fashion",
+        "business_type": row["business_type"] if "business_type" in row.keys() else "General",
         "use_voice_to_voice": True,
         "voice_gender": row["voice_gender"] if "voice_gender" in row.keys() else "female",
         "voice_name": "text",
@@ -134,6 +195,7 @@ def row_to_agent(row: sqlite3.Row, knowledge_count: int = 0) -> dict:
         "catalog_items": catalog_items,
         "faqs": faqs,
         "doctors": doctors,
+        "others": others,
         "created_at": row["created_at"],
         "knowledge_count": knowledge_count,
     }

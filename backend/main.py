@@ -1,5 +1,7 @@
 import json
+import io
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,7 +34,7 @@ from app.services import (
     clean_transcript_text,
     extract_text_from_file,
     generate_assistant_reply,
-    ingest_knowledge_to_supabase,
+    ingest_knowledge_to_local,
     process_knowledge_files,
 )
 
@@ -44,6 +46,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+KNOWLEDGE_TASKS: dict[str, dict] = {}
+KNOWLEDGE_TASKS_LOCK = threading.Lock()
+
+
+class InMemoryUpload:
+    def __init__(self, filename: str, content: bytes):
+        self.filename = filename
+        self.file = io.BytesIO(content)
+
+
+def _set_knowledge_task(task_id: str, patch: dict) -> None:
+    with KNOWLEDGE_TASKS_LOCK:
+        existing = KNOWLEDGE_TASKS.get(task_id, {})
+        existing.update(patch)
+        KNOWLEDGE_TASKS[task_id] = existing
 
 @app.on_event("startup")
 def startup() -> None:
@@ -81,13 +100,12 @@ def get_agent(agent_id: str) -> dict:
 
 @app.post("/agents")
 def create_agent(payload: CreateAgentRequest) -> dict:
-    # Knowledge base source of truth is Supabase/Postgres.
-    try:
-        ingest_knowledge_to_supabase(payload)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to persist knowledge base to Supabase: {exc}")
-
     agent_id = str(uuid.uuid4())
+    try:
+        ingest_knowledge_to_local(agent_id, payload)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to persist knowledge base: {exc}")
+
     created_at = now_iso()
 
     conn = get_conn()
@@ -95,9 +113,9 @@ def create_agent(payload: CreateAgentRequest) -> dict:
         """
         INSERT INTO agents (
             id, name, description, instruction, language, model, temperature, business_type,
-            use_voice_to_voice, voice_gender, business_info_json, catalog_items_json, faqs_json, doctors_json, created_at
+            use_voice_to_voice, voice_gender, business_info_json, catalog_items_json, faqs_json, doctors_json, others_json, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             agent_id,
@@ -114,6 +132,7 @@ def create_agent(payload: CreateAgentRequest) -> dict:
             json.dumps(payload.catalog_items or []),
             json.dumps(payload.faqs or []),
             json.dumps(payload.doctors or []),
+            json.dumps(payload.others or []),
             created_at,
         ),
     )
@@ -126,11 +145,10 @@ def create_agent(payload: CreateAgentRequest) -> dict:
 
 @app.put("/agents/{agent_id}")
 def update_agent(agent_id: str, payload: UpdateAgentRequest) -> dict:
-    # Keep Supabase/Postgres in sync for all knowledge base edits from configuration.
     try:
-        ingest_knowledge_to_supabase(payload)
+        ingest_knowledge_to_local(agent_id, payload)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to update knowledge base in Supabase: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to update knowledge base: {exc}")
 
     conn = get_conn()
     exists = conn.execute("SELECT id FROM agents WHERE id = ?", (agent_id,)).fetchone()
@@ -143,7 +161,7 @@ def update_agent(agent_id: str, payload: UpdateAgentRequest) -> dict:
         UPDATE agents
         SET
             name = ?, description = ?, instruction = ?, language = ?, temperature = ?, business_type = ?,
-            use_voice_to_voice = ?, voice_gender = ?, business_info_json = ?, catalog_items_json = ?, faqs_json = ?, doctors_json = ?
+            use_voice_to_voice = ?, voice_gender = ?, business_info_json = ?, catalog_items_json = ?, faqs_json = ?, doctors_json = ?, others_json = ?
         WHERE id = ?
         """,
         (
@@ -159,6 +177,7 @@ def update_agent(agent_id: str, payload: UpdateAgentRequest) -> dict:
             json.dumps(payload.catalog_items or []),
             json.dumps(payload.faqs or []),
             json.dumps(payload.doctors or []),
+            json.dumps(payload.others or []),
             agent_id,
         ),
     )
@@ -412,6 +431,85 @@ def process_knowledge(files: list[UploadFile] = File(...), business_type: str = 
         raise HTTPException(status_code=500, detail=f"OCR processing failed for {first_file}: {exc}")
 
 
+@app.post("/knowledge/process/start")
+def start_knowledge_process(files: list[UploadFile] = File(...), business_type: str = "General") -> dict:
+    task_id = str(uuid.uuid4())
+    uploads: list[InMemoryUpload] = []
+    for upload in files:
+        if not upload.filename:
+            continue
+        uploads.append(InMemoryUpload(upload.filename, upload.file.read()))
+
+    _set_knowledge_task(
+        task_id,
+        {
+            "task_id": task_id,
+            "status": "running",
+            "business_type": business_type,
+            "progress": {
+                "stage": "queued",
+                "message": "Queued for OCR processing",
+                "current_file_index": 0,
+                "total_files": len(uploads),
+                "current_file": "",
+            },
+            "result": None,
+            "error": None,
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        },
+    )
+
+    def worker() -> None:
+        try:
+            def on_progress(payload: dict) -> None:
+                _set_knowledge_task(
+                    task_id,
+                    {
+                        "progress": payload,
+                        "updated_at": now_iso(),
+                    },
+                )
+
+            result = process_knowledge_files(uploads, business_type, progress_cb=on_progress)
+            _set_knowledge_task(
+                task_id,
+                {
+                    "status": "completed",
+                    "result": result,
+                    "progress": {
+                        "stage": "completed",
+                        "message": "OCR processing completed successfully",
+                        "current_file_index": len(uploads),
+                        "total_files": len(uploads),
+                        "current_file": "",
+                    },
+                    "updated_at": now_iso(),
+                },
+            )
+        except Exception as exc:
+            _set_knowledge_task(
+                task_id,
+                {
+                    "status": "failed",
+                    "error": str(exc),
+                    "updated_at": now_iso(),
+                },
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"task_id": task_id}
+
+
+@app.get("/knowledge/process/{task_id}")
+def get_knowledge_process_status(task_id: str) -> dict:
+    with KNOWLEDGE_TASKS_LOCK:
+        task = KNOWLEDGE_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Processing task not found")
+    return task
+
+
 @app.get("/agents/{agent_id}/sessions")
 def list_sessions(agent_id: str) -> dict:
     conn = get_conn()
@@ -466,7 +564,7 @@ def post_message(session_id: str, payload: SendMessageRequest) -> dict:
 
     agent = conn.execute("SELECT * FROM agents WHERE id = ?", (session["agent_id"],)).fetchone()
     history = conn.execute("SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC", (session_id,)).fetchall()
-    knowledge_ctx = build_context_from_knowledge(conn, session["agent_id"])
+    knowledge_ctx = build_context_from_knowledge(conn, session["agent_id"], payload.content.strip())
     assistant_text = generate_assistant_reply(agent, history, knowledge_ctx)
 
     assistant_message_id = str(uuid.uuid4())
@@ -485,77 +583,64 @@ def post_message(session_id: str, payload: SendMessageRequest) -> dict:
 
 @app.post("/audio/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)) -> dict:
-    api_key = os.getenv("ELEVENLABS_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="Missing ELEVENLABS_API_KEY in agent/.env")
+    import asyncio
+    from google.cloud import speech
 
     content = await audio.read()
-    files = {
-        "file": (audio.filename or "audio.webm", content, audio.content_type or "audio/webm"),
-    }
-    data = {"model_id": "scribe_v1"}
-    headers = {"xi-api-key": api_key}
+
+    def _transcribe():
+        client = speech.SpeechClient()
+        audio_obj = speech.RecognitionAudio(content=content)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,
+            language_code="en-US",
+            enable_automatic_punctuation=True,
+        )
+        response = client.recognize(config=config, audio=audio_obj)
+        return " ".join(
+            r.alternatives[0].transcript for r in response.results if r.alternatives
+        )
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                "https://api.elevenlabs.io/v1/speech-to-text",
-                headers=headers,
-                data=data,
-                files=files,
-            )
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        payload = resp.json()
-        raw_text = payload.get("text") or payload.get("transcript") or ""
+        raw_text = await asyncio.to_thread(_transcribe)
         text = clean_transcript_text(raw_text)
         return {"text": text}
-    except HTTPException:
-        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Transcription error: {exc}")
 
 
 @app.post("/audio/tts")
 async def synthesize_audio(payload: TtsRequest) -> FileResponse:
-    api_key = os.getenv("ELEVENLABS_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="Missing ELEVENLABS_API_KEY in agent/.env")
+    import asyncio
+    from google.cloud import texttospeech
 
-    voice_map = {
-        "female": os.getenv("ELEVENLABS_VOICE_FEMALE") or "EXAVITQu4vr4xnSDxMaL",
-        "male": os.getenv("ELEVENLABS_VOICE_MALE") or "TxGEqnHWrfWFTfGW9XjX",
-    }
-    voice_id = voice_map.get(payload.voice_gender, voice_map["female"])
-    headers = {
-        "xi-api-key": api_key,
-        "Content-Type": "application/json",
-        "Accept": "audio/mpeg",
-    }
-    body = {
-        "text": payload.text,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {"stability": 0.45, "similarity_boost": 0.8},
-    }
     output = UPLOAD_DIR / f"tts_{uuid.uuid4()}.mp3"
 
+    def _synthesize():
+        client = texttospeech.TextToSpeechClient()
+        synthesis_input = texttospeech.SynthesisInput(text=payload.text)
+        voice_name = (
+            "en-US-Journey-F" if payload.voice_gender == "female" else "en-US-Journey-D"
+        )
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="en-US",
+            name=voice_name,
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3
+        )
+        response = client.synthesize_speech(
+            input=synthesis_input, voice=voice, audio_config=audio_config
+        )
+        output.write_bytes(response.audio_content)
+
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-                headers=headers,
-                json=body,
-            )
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        output.write_bytes(resp.content)
+        await asyncio.to_thread(_synthesize)
         return FileResponse(
             str(output),
             media_type="audio/mpeg",
             headers={"Content-Disposition": "inline; filename=\"speech.mp3\""},
         )
-    except HTTPException:
-        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"TTS error: {exc}")
 

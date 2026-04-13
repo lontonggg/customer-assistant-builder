@@ -298,6 +298,9 @@ export default function EndUserChatPage() {
               <p className="text-xs text-zinc-500">{activeSession?.title || "Session"}</p>
             </div>
             <div className="flex items-center gap-2">
+              <Button asChild variant="outline" size="sm">
+                <Link href={`/agents/${agent.id}?tab=configuration`}>Back to Configuration</Link>
+              </Button>
               <Button
                 variant="outline"
                 size="sm"
@@ -307,6 +310,12 @@ export default function EndUserChatPage() {
                 Sessions
               </Button>
             </div>
+          </div>
+
+          <div className="border-b border-zinc-200 bg-amber-50 px-5 py-2">
+            <p className="text-xs text-amber-800">
+              Customer Side (Demo): this page simulates the customer-facing chatbot experience for testing.
+            </p>
           </div>
 
           <div className="flex-1 space-y-3 overflow-y-auto bg-white px-5 py-4">

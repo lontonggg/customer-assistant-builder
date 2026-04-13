@@ -14,6 +14,7 @@ export type Agent = {
   catalog_items?: Array<Record<string, string>>;
   faqs?: Array<{ question: string; answer: string }>;
   doctors?: Array<Record<string, string>>;
+  others?: Array<Record<string, string>>;
   knowledge_count?: number;
   created_at: string;
 };
@@ -47,7 +48,27 @@ export type ProcessedKnowledge = {
   business_info: Record<string, string>;
   catalog_items: Array<Record<string, string>>;
   faqs: Array<{ question: string; answer: string }>;
-  doctors: Array<Record<string, string>>;
+  others: Array<Record<string, string>>;
+};
+
+export type KnowledgeProcessProgress = {
+  stage: string;
+  message: string;
+  current_file_index: number;
+  total_files: number;
+  current_file: string;
+  pages_processed?: number;
+  pages_total?: number;
+  chunk_index?: number;
+  chunks_total?: number;
+};
+
+export type KnowledgeProcessTask = {
+  task_id: string;
+  status: "running" | "completed" | "failed";
+  progress?: KnowledgeProcessProgress;
+  result?: ProcessedKnowledge | null;
+  error?: string | null;
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -88,6 +109,7 @@ export async function createAgent(payload: {
   catalog_items?: Array<Record<string, string>>;
   faqs?: Array<{ question: string; answer: string }>;
   doctors?: Array<Record<string, string>>;
+  others?: Array<Record<string, string>>;
 }): Promise<Agent> {
   const response = await fetch(`${API_BASE}/agents`, {
     method: "POST",
@@ -127,6 +149,29 @@ export async function processKnowledge(
     body: formData,
   });
   return parseJson<ProcessedKnowledge>(response);
+}
+
+export async function startKnowledgeProcess(
+  files: File[],
+  businessType: string,
+): Promise<{ task_id: string }> {
+  const formData = new FormData();
+  files.forEach((file) => formData.append("files", file));
+  formData.append("business_type", businessType);
+  const response = await fetch(`${API_BASE}/knowledge/process/start`, {
+    method: "POST",
+    body: formData,
+  });
+  return parseJson<{ task_id: string }>(response);
+}
+
+export async function fetchKnowledgeProcessTask(
+  taskId: string,
+): Promise<KnowledgeProcessTask> {
+  const response = await fetch(`${API_BASE}/knowledge/process/${taskId}`, {
+    cache: "no-store",
+  });
+  return parseJson<KnowledgeProcessTask>(response);
 }
 
 export async function deleteKnowledgeFile(fileId: string): Promise<void> {
@@ -182,6 +227,7 @@ export async function updateAgent(
     catalog_items?: Array<Record<string, string>>;
     faqs?: Array<{ question: string; answer: string }>;
     doctors?: Array<Record<string, string>>;
+    others?: Array<Record<string, string>>;
   },
 ): Promise<Agent> {
   const response = await fetch(`${API_BASE}/agents/${agentId}`, {

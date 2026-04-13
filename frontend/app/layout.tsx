@@ -29,21 +29,12 @@ export default function RootLayout({
           <div className="mx-auto flex max-w-6xl items-center justify-center gap-2 px-4 py-2 text-xs text-zinc-700 sm:text-sm">
             <span>Powered by</span>
             <a
-              href="https://mistral.ai"
+              href="https://gemini.google.com"
               target="_blank"
               rel="noreferrer"
               className="inline-flex items-center rounded-md px-1 py-0.5 hover:bg-zinc-100"
             >
-              <Image src="/mistral-ai.png" alt="Mistral AI" width={72} height={16} className="h-4 w-auto" />
-            </a>
-            <span>and</span>
-            <a
-              href="https://elevenlabs.io"
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center rounded-md px-1 py-0.5 hover:bg-zinc-100"
-            >
-              <Image src="/elevenlabs.png" alt="ElevenLabs" width={88} height={16} className="h-4 w-auto" />
+              <Image src="/gemini.png" alt="Gemini" width={64} height={16} className="" />
             </a>
           </div>
         </footer>

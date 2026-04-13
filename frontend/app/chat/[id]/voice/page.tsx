@@ -18,6 +18,27 @@ import {
 import { isMockLoggedIn } from "@/lib/mock-auth";
 
 type VoicePhase = "idle" | "greeting" | "listening" | "thinking" | "speaking";
+type TranscriptEntry = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  timestamp: string;
+};
+
+function toPlainSpeechText(input: string): string {
+  return (input || "")
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/^\s*\d+\.\s+/gm, "")
+    .replace(/\\\*/g, "")
+    .replace(/[*_#>~]/g, "")
+    .replace(/`{1,3}/g, "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 export default function VoiceInterfacePage() {
   const params = useParams();
@@ -30,10 +51,16 @@ export default function VoiceInterfacePage() {
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const [transcriptEntries, setTranscriptEntries] = useState<TranscriptEntry[]>([]);
 
   const stopRef = useRef(false);
   const runningRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const transcriptEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [transcriptEntries]);
 
   useEffect(() => {
     if (!isMockLoggedIn()) {
@@ -130,22 +157,51 @@ export default function VoiceInterfacePage() {
       const greetText =
         [...greetMessages].reverse().find((m) => m.role === "assistant")?.content ||
         `Hi! I'm ${agent.name}. How can I help you today?`;
+      const plainGreetText = toPlainSpeechText(greetText);
+      setTranscriptEntries((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-greeting`,
+          role: "assistant",
+          text: plainGreetText,
+          timestamp: new Date().toLocaleTimeString(),
+        },
+      ]);
       setPhase("speaking");
-      await speak(greetText, agent.voice_gender || "female");
+      await speak(plainGreetText, agent.voice_gender || "female");
 
       while (!stopRef.current) {
         setPhase("listening");
         const userText = await listenAndTranscribe();
         if (stopRef.current) break;
         if (!userText) continue;
+        setTranscriptEntries((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-user-${prev.length}`,
+            role: "user",
+            text: userText,
+            timestamp: new Date().toLocaleTimeString(),
+          },
+        ]);
 
         setPhase("thinking");
         const messages = await sendMessage(activeSessionId, userText);
         const assistantText = [...messages].reverse().find((m) => m.role === "assistant")?.content || "";
         if (!assistantText) continue;
+        const plainAssistantText = toPlainSpeechText(assistantText);
+        setTranscriptEntries((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-assistant-${prev.length}`,
+            role: "assistant",
+            text: plainAssistantText,
+            timestamp: new Date().toLocaleTimeString(),
+          },
+        ]);
 
         setPhase("speaking");
-        await speak(assistantText, agent.voice_gender || "female");
+        await speak(plainAssistantText, agent.voice_gender || "female");
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Speech-to-speech failed.");
@@ -242,6 +298,38 @@ export default function VoiceInterfacePage() {
             Agent greets first, then continuously listens and replies. No need to re-enable microphone every turn.
           </p>
           {error ? <p className="mt-3 text-sm text-red-700">{error}</p> : null}
+        </div>
+
+        <div className="mt-4 space-y-3 rounded-2xl border border-zinc-200 bg-white p-4">
+          <h2 className="text-sm font-semibold text-zinc-900">Conversation Transcript</h2>
+          <div className="max-h-80 overflow-y-auto overscroll-contain rounded-xl border border-zinc-200 bg-zinc-50 p-3">
+            {transcriptEntries.length === 0 ? (
+              <p className="text-xs text-zinc-500">No conversation yet.</p>
+            ) : (
+              <div className="space-y-2">
+                {transcriptEntries.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className={`flex ${entry.role === "user" ? "justify-end" : "justify-start"}`}
+                  >
+                    <div
+                      className={`max-w-[88%] rounded-2xl px-3 py-2 ${
+                        entry.role === "user"
+                          ? "bg-zinc-900 text-white"
+                          : "bg-white text-zinc-900 border border-zinc-200"
+                      }`}
+                    >
+                      <p className="text-[11px] font-medium opacity-70">
+                        {entry.role === "user" ? "You" : agent?.name || "Agent"} • {entry.timestamp}
+                      </p>
+                      <p className="mt-1 text-sm whitespace-pre-wrap">{entry.text}</p>
+                    </div>
+                  </div>
+                ))}
+                <div ref={transcriptEndRef} />
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </main>

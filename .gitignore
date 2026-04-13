@@ -20,6 +20,7 @@ backend/app.db
 backend/uploads/
 backend/**/*.mp3
 backend/**/*.sqlite
+backend/chroma_db/
 
 # OCR/extraction generated outputs
 backend/data_entry/output/

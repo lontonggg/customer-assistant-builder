@@ -5,3 +5,7 @@ litellm
 python-multipart
 pypdf
 httpx
+google-cloud-aiplatform
+google-cloud-speech
+google-cloud-texttospeech
+chromadb

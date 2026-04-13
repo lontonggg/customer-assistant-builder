@@ -6,7 +6,13 @@ import { SectionCard } from "@/components/ui/section-card";
 import { Label } from "@/components/ui/label";
 import { FieldShell } from "@/components/ui/field-shell";
 import { Button } from "@/components/ui/button";
-import { createAgent, processKnowledge, uploadKnowledge } from "@/lib/api";
+import {
+  createAgent,
+  fetchKnowledgeProcessTask,
+  startKnowledgeProcess,
+  type KnowledgeProcessProgress,
+  uploadKnowledge,
+} from "@/lib/api";
 import { Stepper } from "@/components/stepper";
 import { IconEye, IconSpinner, IconTrash } from "@/components/ui/icons";
 import { isMockLoggedIn } from "@/lib/mock-auth";
@@ -20,7 +26,6 @@ const languages = [
   { label: "Chinese", value: "zh-CN" },
   { label: "Indian", value: "hi-IN" },
 ];
-const businessTypes = ["Fashion", "Clinic"];
 const steps = ["Setup", "Knowledge base", "Review"];
 
 type EditableFaq = {
@@ -30,43 +35,45 @@ type EditableFaq = {
 
 type CatalogRow = Record<string, string>;
 type BusinessInfo = Record<string, string>;
-type DoctorRow = Record<string, string>;
+type OtherRow = Record<string, string>;
 
-type CatalogColumnRule = {
-  key: string;
-  label: string;
-  valueType: "string" | "int" | "numeric";
-  clinicOnly?: boolean;
-};
+function normalizeBusinessInfo(raw: unknown): BusinessInfo {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const normalized: BusinessInfo = {};
 
-const CATALOG_EDITABLE_RULES: CatalogColumnRule[] = [
-  { key: "name", label: "Name", valueType: "string" },
-  { key: "short_desc", label: "Short Description", valueType: "string" },
-  { key: "price", label: "Price", valueType: "numeric" },
-  { key: "currency_code", label: "Currency Code", valueType: "string" },
-  { key: "duration_mins", label: "Duration (Minutes)", valueType: "int", clinicOnly: true },
+  Object.entries(raw as Record<string, unknown>).forEach(([key, value]) => {
+    if (value == null) {
+      normalized[key] = "";
+      return;
+    }
+    if (typeof value === "object" && !Array.isArray(value)) {
+      Object.entries(value as Record<string, unknown>).forEach(([nestedKey, nestedValue]) => {
+        normalized[`${key}_${nestedKey}`] = String(nestedValue ?? "");
+      });
+      return;
+    }
+    if (Array.isArray(value)) {
+      normalized[key] = value.map((item) => String(item ?? "")).join(", ");
+      return;
+    }
+    normalized[key] = String(value);
+  });
+
+  return normalized;
+}
+
+const CATALOG_COLUMNS = [
+  { key: "name", label: "Name" },
+  { key: "category", label: "Category" },
+  { key: "description", label: "Description" },
+  { key: "price", label: "Price" },
 ];
 
-const getEditableCatalogRules = (businessType: string) =>
-  CATALOG_EDITABLE_RULES.filter((rule) => !rule.clinicOnly || businessType === "Clinic");
-
-const DOCTOR_EDITABLE_RULES = [
-  { key: "full_name", label: "Full Name" },
+const OTHERS_COLUMNS = [
+  { key: "item_type", label: "Type" },
   { key: "title", label: "Title" },
-  { key: "specialization", label: "Specialization" },
-  { key: "qualifications", label: "Qualifications" },
-  { key: "bio", label: "Bio" },
-  { key: "languages", label: "Languages" },
-] as const;
-
-const normalizeNumericInput = (value: string) => {
-  const raw = value.replace(/[^0-9.]/g, "");
-  const dotIndex = raw.indexOf(".");
-  if (dotIndex === -1) return raw;
-  const left = raw.slice(0, dotIndex + 1);
-  const right = raw.slice(dotIndex + 1).replace(/\./g, "");
-  return `${left}${right}`;
-};
+  { key: "content", label: "Content" },
+];
 
 export default function BuilderPage() {
   const router = useRouter();
@@ -82,15 +89,14 @@ export default function BuilderPage() {
   const [voiceGender, setVoiceGender] = useState("female");
   const [businessInfo, setBusinessInfo] = useState<BusinessInfo>({});
   const [ocrFaqs, setOcrFaqs] = useState<EditableFaq[]>([]);
-  const [catalogColumns, setCatalogColumns] = useState<string[]>([]);
   const [catalogRows, setCatalogRows] = useState<CatalogRow[]>([]);
-  const [doctorColumns, setDoctorColumns] = useState<string[]>([]);
-  const [doctorRows, setDoctorRows] = useState<DoctorRow[]>([]);
+  const [othersRows, setOthersRows] = useState<OtherRow[]>([]);
   const [isKnowledgeProcessed, setIsKnowledgeProcessed] = useState(false);
   const [isProcessingKnowledge, setIsProcessingKnowledge] = useState(false);
   const [processingStartedAt, setProcessingStartedAt] = useState<number | null>(null);
   const [processingSeconds, setProcessingSeconds] = useState(0);
   const [lastProcessedSeconds, setLastProcessedSeconds] = useState<number | null>(null);
+  const [, setProcessingProgress] = useState<KnowledgeProcessProgress | null>(null);
   const [showErrors, setShowErrors] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
   const [creatingStartedAt, setCreatingStartedAt] = useState<number | null>(null);
@@ -157,7 +163,7 @@ export default function BuilderPage() {
         name: agentName.trim(),
         description: description.trim() || "Text-based AI chatbot",
         instruction: instruction.trim(),
-        model: "mistral-small",
+        model: "gemini-2.5-flash",
         temperature,
         business_type: businessType,
         use_voice_to_voice: true,
@@ -166,11 +172,11 @@ export default function BuilderPage() {
         business_info: businessInfo,
         catalog_items: catalogRows,
         faqs: ocrFaqs,
-        doctors: doctorRows,
+        others: othersRows,
       });
 
       await uploadKnowledge(agent.id, files);
-      router.push(`/agents/${agent.id}`);
+      router.push(`/agents/${agent.id}?generated=1`);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to create chatbot.";
       setCreateError(message);
@@ -205,10 +211,8 @@ export default function BuilderPage() {
     setIsKnowledgeProcessed(false);
     setBusinessInfo({});
     setOcrFaqs([]);
-    setCatalogColumns([]);
     setCatalogRows([]);
-    setDoctorColumns([]);
-    setDoctorRows([]);
+    setOthersRows([]);
   }, [businessType]);
 
   useEffect(() => {
@@ -226,38 +230,66 @@ export default function BuilderPage() {
     setProcessingStartedAt(startTime);
     setProcessingSeconds(0);
     setLastProcessedSeconds(null);
+    setProcessingProgress({
+      stage: "starting",
+      message: "Starting OCR task...",
+      current_file_index: 0,
+      total_files: files.length,
+      current_file: "",
+    });
     setCreateError(null);
     try {
-      const processed = await processKnowledge(files, businessType || "Fashion");
-      const editableRules = getEditableCatalogRules(businessType);
-      const cols = editableRules.map((rule) => rule.key);
-      const doctorCols = DOCTOR_EDITABLE_RULES.map((rule) => rule.key);
-      setBusinessInfo((processed.business_info || {}) as BusinessInfo);
+      const { task_id } = await startKnowledgeProcess(files, businessType || "General");
+      let processed: {
+        business_info: Record<string, string>;
+        catalog_items: Array<Record<string, string>>;
+        faqs: Array<{ question: string; answer: string }>;
+        others: Array<Record<string, string>>;
+      } | null = null;
+
+      for (let i = 0; i < 240; i++) {
+        const task = await fetchKnowledgeProcessTask(task_id);
+        if (task.progress) setProcessingProgress(task.progress);
+        if (task.status === "completed" && task.result) {
+          processed = task.result;
+          break;
+        }
+        if (task.status === "failed") {
+          throw new Error(task.error || "Knowledge processing failed.");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+
+      if (!processed) {
+        throw new Error("Knowledge processing timed out. Please try again.");
+      }
+
+      setBusinessInfo(normalizeBusinessInfo(processed.business_info));
       setOcrFaqs((processed.faqs || []).map((item) => ({ question: item.question || "", answer: item.answer || "" })));
-      setCatalogColumns(cols);
       setCatalogRows(
         (processed.catalog_items || []).map((row) => {
           const normalized: CatalogRow = {};
-          cols.forEach((col) => {
-            normalized[col] = String(row[col] ?? "");
-          });
+          CATALOG_COLUMNS.forEach(({ key }) => { normalized[key] = String(row[key] ?? ""); });
           return normalized;
         }),
       );
-      setDoctorColumns(doctorCols);
-      setDoctorRows(
-        (processed.doctors || []).map((row) => {
-          const normalized: DoctorRow = {};
-          doctorCols.forEach((col) => {
-            const raw = row[col];
-            normalized[col] = Array.isArray(raw) ? raw.join(", ") : String(raw ?? "");
-          });
+      setOthersRows(
+        (processed.others || []).map((row) => {
+          const normalized: OtherRow = {};
+          OTHERS_COLUMNS.forEach(({ key }) => { normalized[key] = String(row[key] ?? ""); });
           return normalized;
         }),
       );
       setIsKnowledgeProcessed(true);
       const elapsed = Math.max(0, Math.floor((Date.now() - startTime) / 1000));
       setLastProcessedSeconds(elapsed);
+      setProcessingProgress({
+        stage: "completed",
+        message: "OCR completed successfully.",
+        current_file_index: files.length,
+        total_files: files.length,
+        current_file: "",
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Knowledge processing failed.";
       setCreateError(message);
@@ -337,20 +369,12 @@ export default function BuilderPage() {
                     Business type <span className="text-red-600">*</span>
                   </Label>
                   <FieldShell className={showErrors && !businessType ? "border-red-500/80" : undefined}>
-                    <select
+                    <input
                       value={businessType}
                       onChange={(e) => setBusinessType(e.target.value)}
-                      className="w-full bg-transparent text-zinc-900 focus:outline-none"
-                    >
-                      <option value="" className="bg-white text-zinc-500">
-                        Select business type
-                      </option>
-                      {businessTypes.map((type) => (
-                        <option key={type} value={type} className="bg-white">
-                          {type}
-                        </option>
-                      ))}
-                    </select>
+                      className="w-full bg-transparent text-zinc-900 placeholder:text-zinc-500 focus:outline-none"
+                      placeholder="E.g. Restaurant, Dental Clinic, Fashion Retail, Hotel..."
+                    />
                   </FieldShell>
                   {showErrors && !businessType ? (
                     <p className="text-xs text-red-700">Business type is required.</p>
@@ -510,9 +534,9 @@ export default function BuilderPage() {
                   </Button>
                   {createError ? <p className="text-xs text-red-700">{createError}</p> : null}
                   {!isKnowledgeProcessed ? (
-                    <p className="text-xs text-zinc-600">
-                      Process the uploaded files first to generate editable FAQ and catalog data.
-                    </p>
+                    <div className="space-y-1 text-xs text-zinc-600">
+                      <p>Process the uploaded files first to generate editable FAQ and catalog data.</p>
+                    </div>
                   ) : (
                     <p className="text-xs text-emerald-700">
                       Successfully processed in {lastProcessedSeconds ?? 0}s. You can review and edit below.
@@ -548,16 +572,14 @@ export default function BuilderPage() {
                     </div>
 
                     <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4">
-                      <p className="text-sm font-semibold text-zinc-900">{businessType === "Clinic" ? "Services" : "Products"}</p>
+                      <p className="text-sm font-semibold text-zinc-900">Catalog</p>
                       <div className="overflow-x-auto">
                         <table className="min-w-full border-collapse text-left text-xs">
                           <thead>
                             <tr>
-                              {catalogColumns.map((column, colIndex) => (
-                                <th key={`header-${colIndex}`} className="border border-zinc-200 bg-zinc-50 p-2 align-top">
-                                  <span className="block px-2 py-1 font-semibold text-zinc-900">
-                                    {getEditableCatalogRules(businessType).find((rule) => rule.key === column)?.label || column}
-                                  </span>
+                              {CATALOG_COLUMNS.map((col) => (
+                                <th key={col.key} className="border border-zinc-200 bg-zinc-50 p-2 align-top">
+                                  <span className="block px-2 py-1 font-semibold text-zinc-900">{col.label}</span>
                                 </th>
                               ))}
                             </tr>
@@ -565,25 +587,15 @@ export default function BuilderPage() {
                           <tbody>
                             {catalogRows.map((row, rowIndex) => (
                               <tr key={`row-${rowIndex}`}>
-                                {catalogColumns.map((column, colIndex) => (
-                                  <td key={`cell-${rowIndex}-${colIndex}`} className="border border-zinc-200 p-2 align-top">
+                                {CATALOG_COLUMNS.map((col) => (
+                                  <td key={`cell-${rowIndex}-${col.key}`} className="border border-zinc-200 p-2 align-top">
                                     <input
-                                      value={row[column] ?? ""}
-                                      onChange={(e) => {
-                                        const rawValue = e.target.value;
-                                        const rule = getEditableCatalogRules(businessType).find(
-                                          (item) => item.key === column,
-                                        );
-                                        const value =
-                                          rule?.valueType === "int"
-                                            ? rawValue.replace(/\D/g, "")
-                                            : rule?.valueType === "numeric"
-                                              ? normalizeNumericInput(rawValue)
-                                              : rawValue;
+                                      value={row[col.key] ?? ""}
+                                      onChange={(e) =>
                                         setCatalogRows((prev) =>
-                                          prev.map((r, i) => (i === rowIndex ? { ...r, [column]: value } : r)),
-                                        );
-                                      }}
+                                          prev.map((r, i) => (i === rowIndex ? { ...r, [col.key]: e.target.value } : r)),
+                                        )
+                                      }
                                       className="w-full min-w-[180px] rounded-md border border-zinc-200 bg-white px-2 py-1 text-zinc-900 focus:border-zinc-400 focus:outline-none"
                                     />
                                   </td>
@@ -595,73 +607,71 @@ export default function BuilderPage() {
                       </div>
                     </div>
 
-                    {businessType === "Clinic" ? (
-                      <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4">
-                        <div className="flex items-center justify-between gap-3">
-                          <p className="text-sm font-semibold text-zinc-900">Doctors</p>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() =>
-                              setDoctorRows((prev) => [
-                                ...prev,
-                                Object.fromEntries(doctorColumns.map((col) => [col, ""])),
-                              ])
-                            }
-                          >
-                            Add Doctor
-                          </Button>
+                    <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-semibold text-zinc-900">Others</p>
+                          <p className="text-xs text-zinc-500">Staff, locations, policies, testimonials, awards, etc.</p>
                         </div>
-                        <div className="overflow-x-auto">
-                          <table className="min-w-full border-collapse text-left text-xs">
-                            <thead>
-                              <tr>
-                                {doctorColumns.map((column, colIndex) => (
-                                  <th key={`doctor-header-${colIndex}`} className="border border-zinc-200 bg-zinc-50 p-2 align-top">
-                                    <span className="block px-2 py-1 font-semibold text-zinc-900">
-                                      {DOCTOR_EDITABLE_RULES.find((rule) => rule.key === column)?.label || column}
-                                    </span>
-                                  </th>
-                                ))}
-                                <th className="border border-zinc-200 bg-zinc-50 p-2 align-top">
-                                  <span className="block px-2 py-1 font-semibold text-zinc-900">Action</span>
-                                </th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {doctorRows.map((row, rowIndex) => (
-                                <tr key={`doctor-row-${rowIndex}`}>
-                                  {doctorColumns.map((column, colIndex) => (
-                                    <td key={`doctor-cell-${rowIndex}-${colIndex}`} className="border border-zinc-200 p-2 align-top">
-                                      <input
-                                        value={row[column] ?? ""}
-                                        onChange={(e) => {
-                                          const value = e.target.value;
-                                          setDoctorRows((prev) =>
-                                            prev.map((r, i) => (i === rowIndex ? { ...r, [column]: value } : r)),
-                                          );
-                                        }}
-                                        className="w-full min-w-[180px] rounded-md border border-zinc-200 bg-white px-2 py-1 text-zinc-900 focus:border-zinc-400 focus:outline-none"
-                                      />
-                                    </td>
-                                  ))}
-                                  <td className="border border-zinc-200 p-2 align-top">
-                                    <button
-                                      type="button"
-                                      onClick={() => setDoctorRows((prev) => prev.filter((_, i) => i !== rowIndex))}
-                                      className="rounded-md p-1 text-red-700 hover:bg-red-100"
-                                      aria-label={`Delete doctor row ${rowIndex + 1}`}
-                                    >
-                                      <IconTrash className="h-4 w-4" />
-                                    </button>
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            setOthersRows((prev) => [
+                              ...prev,
+                              Object.fromEntries(OTHERS_COLUMNS.map((col) => [col.key, ""])),
+                            ])
+                          }
+                        >
+                          Add Row
+                        </Button>
                       </div>
-                    ) : null}
+                      <div className="overflow-x-auto">
+                        <table className="min-w-full border-collapse text-left text-xs">
+                          <thead>
+                            <tr>
+                              {OTHERS_COLUMNS.map((col) => (
+                                <th key={col.key} className="border border-zinc-200 bg-zinc-50 p-2 align-top">
+                                  <span className="block px-2 py-1 font-semibold text-zinc-900">{col.label}</span>
+                                </th>
+                              ))}
+                              <th className="border border-zinc-200 bg-zinc-50 p-2 align-top">
+                                <span className="block px-2 py-1 font-semibold text-zinc-900">Action</span>
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {othersRows.map((row, rowIndex) => (
+                              <tr key={`others-row-${rowIndex}`}>
+                                {OTHERS_COLUMNS.map((col) => (
+                                  <td key={`others-cell-${rowIndex}-${col.key}`} className="border border-zinc-200 p-2 align-top">
+                                    <input
+                                      value={row[col.key] ?? ""}
+                                      onChange={(e) =>
+                                        setOthersRows((prev) =>
+                                          prev.map((r, i) => (i === rowIndex ? { ...r, [col.key]: e.target.value } : r)),
+                                        )
+                                      }
+                                      className="w-full min-w-[180px] rounded-md border border-zinc-200 bg-white px-2 py-1 text-zinc-900 focus:border-zinc-400 focus:outline-none"
+                                    />
+                                  </td>
+                                ))}
+                                <td className="border border-zinc-200 p-2 align-top">
+                                  <button
+                                    type="button"
+                                    onClick={() => setOthersRows((prev) => prev.filter((_, i) => i !== rowIndex))}
+                                    className="rounded-md p-1 text-red-700 hover:bg-red-100"
+                                    aria-label={`Delete row ${rowIndex + 1}`}
+                                  >
+                                    <IconTrash className="h-4 w-4" />
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
 
                     <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4">
                       <div className="flex items-center justify-between gap-3">
@@ -751,16 +761,14 @@ export default function BuilderPage() {
                 </div>
 
                 <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4">
-                  <p className="text-sm font-semibold text-zinc-900">{businessType === "Clinic" ? "Services" : "Products"}</p>
+                  <p className="text-sm font-semibold text-zinc-900">Catalog</p>
                   <div className="overflow-x-auto">
                     <table className="min-w-full border-collapse text-left text-xs">
                       <thead>
                         <tr>
-                          {catalogColumns.map((column, colIndex) => (
-                            <th key={`review-header-${colIndex}`} className="border border-zinc-200 bg-zinc-50 p-2 align-top">
-                              <span className="block px-2 py-1 font-semibold text-zinc-900">
-                                {getEditableCatalogRules(businessType).find((rule) => rule.key === column)?.label || column}
-                              </span>
+                          {CATALOG_COLUMNS.map((col) => (
+                            <th key={`review-header-${col.key}`} className="border border-zinc-200 bg-zinc-50 p-2 align-top">
+                              <span className="block px-2 py-1 font-semibold text-zinc-900">{col.label}</span>
                             </th>
                           ))}
                         </tr>
@@ -768,10 +776,10 @@ export default function BuilderPage() {
                       <tbody>
                         {catalogRows.map((row, rowIndex) => (
                           <tr key={`review-row-${rowIndex}`}>
-                            {catalogColumns.map((column, colIndex) => (
-                              <td key={`review-cell-${rowIndex}-${colIndex}`} className="border border-zinc-200 p-2 align-top">
+                            {CATALOG_COLUMNS.map((col) => (
+                              <td key={`review-cell-${rowIndex}-${col.key}`} className="border border-zinc-200 p-2 align-top">
                                 <span className="block min-w-[180px] px-1 py-0.5 text-zinc-900 whitespace-pre-wrap">
-                                  {row[column] || "-"}
+                                  {row[col.key] || "-"}
                                 </span>
                               </td>
                             ))}
@@ -782,43 +790,39 @@ export default function BuilderPage() {
                   </div>
                 </div>
 
-                {businessType === "Clinic" ? (
-                  <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4">
-                    <p className="text-sm font-semibold text-zinc-900">Doctors</p>
-                    {doctorRows.length === 0 ? (
-                      <p className="text-xs text-zinc-600">No doctors.</p>
-                    ) : (
-                      <div className="overflow-x-auto">
-                        <table className="min-w-full border-collapse text-left text-xs">
-                          <thead>
-                            <tr>
-                              {doctorColumns.map((column, colIndex) => (
-                                <th key={`review-doctor-header-${colIndex}`} className="border border-zinc-200 bg-zinc-50 p-2 align-top">
-                                  <span className="block px-2 py-1 font-semibold text-zinc-900">
-                                    {DOCTOR_EDITABLE_RULES.find((rule) => rule.key === column)?.label || column}
+                <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4">
+                  <p className="text-sm font-semibold text-zinc-900">Others</p>
+                  {othersRows.length === 0 ? (
+                    <p className="text-xs text-zinc-600">No other entries.</p>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full border-collapse text-left text-xs">
+                        <thead>
+                          <tr>
+                            {OTHERS_COLUMNS.map((col) => (
+                              <th key={`review-others-header-${col.key}`} className="border border-zinc-200 bg-zinc-50 p-2 align-top">
+                                <span className="block px-2 py-1 font-semibold text-zinc-900">{col.label}</span>
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {othersRows.map((row, rowIndex) => (
+                            <tr key={`review-others-row-${rowIndex}`}>
+                              {OTHERS_COLUMNS.map((col) => (
+                                <td key={`review-others-cell-${rowIndex}-${col.key}`} className="border border-zinc-200 p-2 align-top">
+                                  <span className="block min-w-[180px] px-1 py-0.5 text-zinc-900 whitespace-pre-wrap">
+                                    {row[col.key] || "-"}
                                   </span>
-                                </th>
+                                </td>
                               ))}
                             </tr>
-                          </thead>
-                          <tbody>
-                            {doctorRows.map((row, rowIndex) => (
-                              <tr key={`review-doctor-row-${rowIndex}`}>
-                                {doctorColumns.map((column, colIndex) => (
-                                  <td key={`review-doctor-cell-${rowIndex}-${colIndex}`} className="border border-zinc-200 p-2 align-top">
-                                    <span className="block min-w-[180px] px-1 py-0.5 text-zinc-900 whitespace-pre-wrap">
-                                      {row[column] || "-"}
-                                    </span>
-                                  </td>
-                                ))}
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
-                  </div>
-                ) : null}
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
 
                 <div className="space-y-3 rounded-2xl border border-zinc-200 bg-white p-4">
                   <p className="text-sm font-semibold text-zinc-900">FAQ List</p>

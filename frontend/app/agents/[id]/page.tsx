@@ -33,13 +33,69 @@ const languageOptions = [
   { value: "zh-CN", label: "Chinese" },
   { value: "hi-IN", label: "Indian" },
 ];
-const businessTypes = ["Fashion", "Clinic"];
+// Safety fallback for stale dev bundles that still reference businessTypes during HMR.
+const businessTypes = ["General", "Fashion", "Clinic"];
 type EditableFaq = { question: string; answer: string };
 type BusinessInfo = Record<string, string>;
 type CatalogRow = Record<string, string>;
-type DoctorRow = Record<string, string>;
-const editableCatalogColumns = ["name", "short_desc", "price", "currency_code", "duration_mins"] as const;
-const editableDoctorColumns = ["full_name", "title", "specialization", "qualifications", "bio", "languages"] as const;
+type OtherRow = Record<string, string>;
+
+function normalizeBusinessInfo(raw: unknown): BusinessInfo {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const normalized: BusinessInfo = {};
+
+  Object.entries(raw as Record<string, unknown>).forEach(([key, value]) => {
+    if (value == null) {
+      normalized[key] = "";
+      return;
+    }
+    if (typeof value === "object" && !Array.isArray(value)) {
+      Object.entries(value as Record<string, unknown>).forEach(([nestedKey, nestedValue]) => {
+        normalized[`${key}_${nestedKey}`] = String(nestedValue ?? "");
+      });
+      return;
+    }
+    if (Array.isArray(value)) {
+      normalized[key] = value.map((item) => String(item ?? "")).join(", ");
+      return;
+    }
+    normalized[key] = String(value);
+  });
+
+  return normalized;
+}
+
+function normalizeTableRows(raw: unknown): Array<Record<string, string>> {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => {
+      const normalized: Record<string, string> = {};
+      Object.entries(item as Record<string, unknown>).forEach(([key, value]) => {
+        if (value == null) {
+          normalized[key] = "";
+        } else if (Array.isArray(value)) {
+          normalized[key] = value.map((v) => String(v ?? "")).join(", ");
+        } else if (typeof value === "object") {
+          normalized[key] = JSON.stringify(value);
+        } else {
+          normalized[key] = String(value);
+        }
+      });
+      return normalized;
+    });
+}
+
+function getTableColumns(
+  rows: Array<Record<string, string>>,
+  preferredOrder: string[] = [],
+): string[] {
+  const keys = new Set<string>();
+  rows.forEach((row) => Object.keys(row).forEach((k) => keys.add(k)));
+  const ordered = preferredOrder.filter((key) => keys.has(key));
+  const remaining = [...keys].filter((key) => !preferredOrder.includes(key)).sort();
+  return [...ordered, ...remaining];
+}
 
 type TabKey = "analytics" | "configuration";
 const trendRangeOptions = [
@@ -84,8 +140,17 @@ export default function AgentAdminPage() {
   const [businessInfo, setBusinessInfo] = useState<BusinessInfo>({});
   const [catalogRows, setCatalogRows] = useState<CatalogRow[]>([]);
   const [faqs, setFaqs] = useState<EditableFaq[]>([]);
-  const [doctors, setDoctors] = useState<DoctorRow[]>([]);
+  const [othersRows, setOthersRows] = useState<OtherRow[]>([]);
   const [authReady, setAuthReady] = useState(false);
+
+  const catalogColumns = useMemo(
+    () => getTableColumns(catalogRows, ["name", "category", "description", "price"]),
+    [catalogRows],
+  );
+  const othersColumns = useMemo(
+    () => getTableColumns(othersRows, ["item_type", "title", "content"]),
+    [othersRows],
+  );
 
   useEffect(() => {
     if (!isMockLoggedIn()) {
@@ -99,6 +164,10 @@ export default function AgentAdminPage() {
     const requestedTab = searchParams.get("tab");
     if (requestedTab === "configuration" || requestedTab === "analytics") {
       setTab(requestedTab);
+    }
+    if (searchParams.get("generated") === "1") {
+      setSaveMessage("Generated Successfully!");
+      setTimeout(() => setSaveMessage(null), 3000);
     }
   }, [searchParams]);
 
@@ -127,21 +196,12 @@ export default function AgentAdminPage() {
         setInstruction(agentData.instruction);
         setLanguage(agentData.language || "en-US");
         setTemperature(typeof agentData.temperature === "number" ? agentData.temperature : 0.4);
-        setBusinessType(agentData.business_type || "Fashion");
+        setBusinessType(agentData.business_type || "General");
         setVoiceGender(agentData.voice_gender || "female");
-        setBusinessInfo((agentData.business_info as BusinessInfo) || {});
-        setCatalogRows((agentData.catalog_items as CatalogRow[]) || []);
+        setBusinessInfo(normalizeBusinessInfo(agentData.business_info));
+        setCatalogRows(normalizeTableRows(agentData.catalog_items));
         setFaqs((agentData.faqs as EditableFaq[]) || []);
-        setDoctors(
-          ((agentData.doctors as Record<string, unknown>[]) || []).map((row) => {
-            const normalized: DoctorRow = {};
-            editableDoctorColumns.forEach((column) => {
-              const raw = row?.[column];
-              normalized[column] = Array.isArray(raw) ? raw.join(", ") : String(raw ?? "");
-            });
-            return normalized;
-          }),
-        );
+        setOthersRows(normalizeTableRows(agentData.others || agentData.doctors));
         setError(null);
       } catch (err) {
         if (!isActive) return;
@@ -186,7 +246,7 @@ export default function AgentAdminPage() {
         business_info: businessInfo,
         catalog_items: catalogRows,
         faqs,
-        doctors,
+        others: othersRows,
       });
 
       if (newFiles.length > 0) {
@@ -353,6 +413,11 @@ export default function AgentAdminPage() {
             </button>
           </div>
         </div>
+        {saveMessage ? (
+          <div className="mt-3 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
+            {saveMessage}
+          </div>
+        ) : null}
 
         {tab === "analytics" ? (
           <div className="mt-6 grid gap-6 lg:grid-cols-[1.2fr_0.8fr]">
@@ -426,11 +491,12 @@ export default function AgentAdminPage() {
                   <div className="space-y-2">
                     <Label>Business type</Label>
                     <FieldShell>
-                      <select value={businessType} onChange={(e) => setBusinessType(e.target.value)} className="w-full bg-transparent text-zinc-900 focus:outline-none">
-                        {businessTypes.map((type) => (
-                          <option key={type} value={type}>{type}</option>
-                        ))}
-                      </select>
+                      <input
+                        value={businessType}
+                        onChange={(e) => setBusinessType(e.target.value)}
+                        className="w-full bg-transparent text-zinc-900 placeholder:text-zinc-500 focus:outline-none"
+                        placeholder="E.g. Textile, Clinic, Restaurant..."
+                      />
                     </FieldShell>
                   </div>
 
@@ -525,53 +591,59 @@ export default function AgentAdminPage() {
                 </div>
 
                 <div className="space-y-2">
-                  <Label>{businessType === "Clinic" ? "Services" : "Products"}</Label>
+                  <div className="flex items-center justify-between">
+                    <Label>Catalog</Label>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() =>
+                        setCatalogRows((prev) => [
+                          ...prev,
+                          Object.fromEntries((catalogColumns.length ? catalogColumns : ["name", "category", "description", "price"]).map((column) => [column, ""])),
+                        ])
+                      }
+                    >
+                      Add Row
+                    </Button>
+                  </div>
                   <div className="overflow-x-auto rounded-2xl border border-zinc-200 bg-zinc-50 p-3">
                     <table className="min-w-full border-collapse text-left text-xs">
                       <thead>
                         <tr>
-                          {editableCatalogColumns
-                            .filter((c) => c !== "duration_mins" || businessType === "Clinic")
-                            .map((column) => (
-                              <th key={column} className="border border-zinc-200 bg-white p-2 font-semibold text-zinc-800">
-                                {column === "name"
-                                  ? "Name"
-                                  : column === "short_desc"
-                                    ? "Short Description"
-                                    : column === "price"
-                                      ? "Price"
-                                      : column === "currency_code"
-                                        ? "Currency Code"
-                                        : "Duration (Minutes)"}
-                              </th>
-                            ))}
+                          {(catalogColumns.length ? catalogColumns : ["name", "category", "description", "price"]).map((column) => (
+                            <th key={column} className="border border-zinc-200 bg-white p-2 font-semibold text-zinc-800 capitalize">
+                              {column.replaceAll("_", " ")}
+                            </th>
+                          ))}
+                          <th className="border border-zinc-200 bg-white p-2 font-semibold text-zinc-800">Action</th>
                         </tr>
                       </thead>
                       <tbody>
                         {catalogRows.map((row, rowIndex) => (
                           <tr key={`catalog-row-${rowIndex}`}>
-                            {editableCatalogColumns
-                              .filter((c) => c !== "duration_mins" || businessType === "Clinic")
-                              .map((column) => (
-                                <td key={`${column}-${rowIndex}`} className="border border-zinc-200 p-2">
-                                  <input
-                                    value={row[column] ?? ""}
-                                    onChange={(e) => {
-                                      const raw = e.target.value;
-                                      const value =
-                                        column === "duration_mins"
-                                          ? raw.replace(/\D/g, "")
-                                          : column === "price"
-                                            ? raw.replace(/[^0-9.]/g, "")
-                                            : raw;
-                                      setCatalogRows((prev) =>
-                                        prev.map((item, i) => (i === rowIndex ? { ...item, [column]: value } : item)),
-                                      );
-                                    }}
-                                    className="w-full min-w-[160px] rounded-md border border-zinc-200 bg-white px-2 py-1 text-zinc-900 focus:border-zinc-400 focus:outline-none"
-                                  />
-                                </td>
-                              ))}
+                            {(catalogColumns.length ? catalogColumns : ["name", "category", "description", "price"]).map((column) => (
+                              <td key={`${column}-${rowIndex}`} className="border border-zinc-200 p-2">
+                                <input
+                                  value={row[column] ?? ""}
+                                  onChange={(e) =>
+                                    setCatalogRows((prev) =>
+                                      prev.map((item, i) => (i === rowIndex ? { ...item, [column]: e.target.value } : item)),
+                                    )
+                                  }
+                                  className="w-full min-w-[160px] rounded-md border border-zinc-200 bg-white px-2 py-1 text-zinc-900 focus:border-zinc-400 focus:outline-none"
+                                />
+                              </td>
+                            ))}
+                            <td className="border border-zinc-200 p-2">
+                              <button
+                                type="button"
+                                onClick={() => setCatalogRows((prev) => prev.filter((_, i) => i !== rowIndex))}
+                                className="rounded-md p-1 text-red-700 hover:bg-red-100"
+                                aria-label={`Delete catalog row ${rowIndex + 1}`}
+                              >
+                                <IconTrash className="h-4 w-4" />
+                              </button>
+                            </td>
                           </tr>
                         ))}
                       </tbody>
@@ -579,80 +651,66 @@ export default function AgentAdminPage() {
                   </div>
                 </div>
 
-                {businessType === "Clinic" ? (
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <Label>Doctors</Label>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() =>
-                          setDoctors((prev) => [
-                            ...prev,
-                            Object.fromEntries(editableDoctorColumns.map((column) => [column, ""])),
-                          ])
-                        }
-                      >
-                        Add Doctor
-                      </Button>
-                    </div>
-                    <div className="overflow-x-auto rounded-2xl border border-zinc-200 bg-zinc-50 p-3">
-                      <table className="min-w-full border-collapse text-left text-xs">
-                        <thead>
-                          <tr>
-                            {editableDoctorColumns.map((column) => (
-                              <th key={column} className="border border-zinc-200 bg-white p-2 font-semibold text-zinc-800">
-                                {column === "full_name"
-                                  ? "Full Name"
-                                  : column === "title"
-                                    ? "Title"
-                                    : column === "specialization"
-                                      ? "Specialization"
-                                      : column === "qualifications"
-                                        ? "Qualifications"
-                                        : column === "bio"
-                                          ? "Bio"
-                                          : "Languages"}
-                              </th>
-                            ))}
-                            <th className="border border-zinc-200 bg-white p-2 font-semibold text-zinc-800">Action</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {doctors.map((row, rowIndex) => (
-                            <tr key={`doctor-row-${rowIndex}`}>
-                              {editableDoctorColumns.map((column) => (
-                                <td key={`${column}-${rowIndex}`} className="border border-zinc-200 p-2">
-                                  <input
-                                    value={row[column] ?? ""}
-                                    onChange={(e) =>
-                                      setDoctors((prev) =>
-                                        prev.map((item, i) =>
-                                          i === rowIndex ? { ...item, [column]: e.target.value } : item,
-                                        ),
-                                      )
-                                    }
-                                    className="w-full min-w-[160px] rounded-md border border-zinc-200 bg-white px-2 py-1 text-zinc-900 focus:border-zinc-400 focus:outline-none"
-                                  />
-                                </td>
-                              ))}
-                              <td className="border border-zinc-200 p-2">
-                                <button
-                                  type="button"
-                                  onClick={() => setDoctors((prev) => prev.filter((_, i) => i !== rowIndex))}
-                                  className="rounded-md p-1 text-red-700 hover:bg-red-100"
-                                  aria-label={`Delete doctor ${rowIndex + 1}`}
-                                >
-                                  <IconTrash className="h-4 w-4" />
-                                </button>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <Label>Others</Label>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() =>
+                        setOthersRows((prev) => [
+                          ...prev,
+                          Object.fromEntries((othersColumns.length ? othersColumns : ["item_type", "title", "content"]).map((column) => [column, ""])),
+                        ])
+                      }
+                    >
+                      Add Row
+                    </Button>
                   </div>
-                ) : null}
+                  <div className="overflow-x-auto rounded-2xl border border-zinc-200 bg-zinc-50 p-3">
+                    <table className="min-w-full border-collapse text-left text-xs">
+                      <thead>
+                        <tr>
+                          {(othersColumns.length ? othersColumns : ["item_type", "title", "content"]).map((column) => (
+                            <th key={column} className="border border-zinc-200 bg-white p-2 font-semibold text-zinc-800 capitalize">
+                              {column.replaceAll("_", " ")}
+                            </th>
+                          ))}
+                          <th className="border border-zinc-200 bg-white p-2 font-semibold text-zinc-800">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {othersRows.map((row, rowIndex) => (
+                          <tr key={`others-row-${rowIndex}`}>
+                            {(othersColumns.length ? othersColumns : ["item_type", "title", "content"]).map((column) => (
+                              <td key={`${column}-${rowIndex}`} className="border border-zinc-200 p-2">
+                                <input
+                                  value={row[column] ?? ""}
+                                  onChange={(e) =>
+                                    setOthersRows((prev) =>
+                                      prev.map((item, i) => (i === rowIndex ? { ...item, [column]: e.target.value } : item)),
+                                    )
+                                  }
+                                  className="w-full min-w-[160px] rounded-md border border-zinc-200 bg-white px-2 py-1 text-zinc-900 focus:border-zinc-400 focus:outline-none"
+                                />
+                              </td>
+                            ))}
+                            <td className="border border-zinc-200 p-2">
+                              <button
+                                type="button"
+                                onClick={() => setOthersRows((prev) => prev.filter((_, i) => i !== rowIndex))}
+                                className="rounded-md p-1 text-red-700 hover:bg-red-100"
+                                aria-label={`Delete row ${rowIndex + 1}`}
+                              >
+                                <IconTrash className="h-4 w-4" />
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
 
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
